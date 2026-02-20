@@ -413,10 +413,15 @@ class BaseModel(pl.LightningModule):
         self.exclude_insample_y = exclude_insample_y
 
         # Scaler
+        window_len = trainer_kwargs.pop("window_len", 5)
+        trend_feature_indices = trainer_kwargs.pop("trend_feature_indices", None)
+        
         self.scaler = TemporalNorm(
             scaler_type=scaler_type,
             dim=1,  # Time dimension is 1.
             num_features=1 + len(self.hist_exog_list) + len(self.futr_exog_list),
+            window_len=window_len,
+            trend_feature_indices=trend_feature_indices,
         )
 
         # Fit arguments
@@ -464,9 +469,9 @@ class BaseModel(pl.LightningModule):
         torch.manual_seed(random_seed)
 
     def _get_temporal_exogenous_cols(self, temporal_cols):
-        return list(
-            set(temporal_cols.tolist()) & set(self.hist_exog_list + self.futr_exog_list)
-        )
+        # Preserve order from temporal_cols
+        exog_set = set(self.hist_exog_list + self.futr_exog_list)
+        return [col for col in temporal_cols if col in exog_set]
 
     def _set_quantiles(self, quantiles=None):
         if quantiles is None and isinstance(

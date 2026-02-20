@@ -2,7 +2,7 @@
 
 
 __all__ = ['masked_median', 'masked_mean', 'minmax_statistics', 'minmax1_statistics', 'std_statistics', 'robust_statistics',
-           'invariant_statistics', 'identity_statistics', 'TemporalNorm']
+           'invariant_statistics', 'identity_statistics', 'marevin_statistics', 'skrevin_statistics', 'TemporalNorm']
 
 
 import torch
@@ -342,6 +342,138 @@ def inv_identity_scaler(z, x_shift, x_scale):
     return z
 
 
+def marevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_indices=None):
+    r"""MARevIN Scaler (Moving-Anchor RevIN — Ablation Version)
+
+    Computes hybrid center and global standard deviation statistics.
+
+    **Center (shift):**
+    - Non-trend features use the global masked mean.
+    - Trend features (specified by `trend_feature_indices`) use a local
+      moving anchor: the masked mean of the last `window_len` timesteps.
+
+    **Scale:**
+    - Global masked standard deviation for all features.
+
+    Args:
+        x (torch.Tensor): Input tensor, shape [B, T, C].
+        mask (torch.Tensor): Boolean tensor, same shape as `x`. True where valid,
+            False where masked.
+        dim (int, optional): Dimension over which to compute statistics. Defaults to -1.
+        eps (float, optional): Small value to avoid division by zero. Defaults to 1e-6.
+        window_len (int, optional): Number of trailing timesteps for the local
+            moving anchor. Defaults to 5.
+        trend_feature_indices (list or None, optional): Channel indices that should
+            use the local moving anchor instead of the global mean. If None or empty,
+            all features use the global mean. Defaults to None.
+
+    Returns:
+        tuple[torch.Tensor, torch.Tensor]: (center_stats, stdev), both broadcastable
+            to the shape of `x`.
+    """
+    if trend_feature_indices is None:
+        trend_feature_indices = []
+
+    # Global statistics (masked)
+    global_mean = masked_mean(x=x, mask=mask, dim=dim)
+    x_stds = torch.sqrt(masked_mean(x=(x - global_mean) ** 2, mask=mask, dim=dim))
+
+    # Protect against division by zero
+    x_stds[x_stds == 0] = 1.0
+    x_stds = x_stds + eps
+
+    # Local moving anchor (last window_len timesteps)
+    if len(trend_feature_indices) > 0:
+        time_axis = dim if dim >= 0 else x.dim() + dim
+        T = x.shape[time_axis]
+        effective_window = min(window_len, T)
+
+        x_window = x.narrow(time_axis, T - effective_window, effective_window)
+        mask_window = mask.narrow(time_axis, T - effective_window, effective_window)
+        moving_anchor = masked_mean(x=x_window, mask=mask_window, dim=dim)
+
+    # Hybrid center: start from global mean, overwrite trend channels
+    center_stats = global_mean.clone()
+
+    if len(trend_feature_indices) > 0:
+        idx = trend_feature_indices
+        if dim == 1:
+            # center_stats shape: [B, 1, C] — channel axis = 2
+            center_stats[:, :, idx] = moving_anchor[:, :, idx]
+        # dim=-1 on [B,T,C] collapses C → [B,T,1], per-channel anchor
+        # doesn't apply — global mean is kept (safe no-op fallback).
+    
+    return center_stats, x_stds
+
+
+def marevin_scaler(x, center_stats, stdev):
+    return (x - center_stats) / stdev
+
+
+def inv_marevin_scaler(z, center_stats, stdev):
+    return z * stdev + center_stats
+
+
+def skrevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_indices=None):
+    """
+    Computes SKRevIN statistics:
+    - Center: Moving anchor (mean of last window_len) with skewness correction
+    - Scale: Global std modulated by kurtosis
+    """
+    # 1. Global statistics (for skew/kurt computation)
+    global_mean = masked_mean(x=x, mask=mask, dim=dim)
+    global_stdev = torch.sqrt(masked_mean(x=(x - global_mean) ** 2, mask=mask, dim=dim))
+    global_stdev[global_stdev == 0] = 1.0
+    global_stdev = global_stdev + eps
+    
+    # 2. Compute skewness and kurtosis
+    z = (x - global_mean) / global_stdev
+    skew = masked_mean(x=z**3, mask=mask, dim=dim)
+    kurt = masked_mean(x=z**4, mask=mask, dim=dim)
+    
+    # 3. Local moving anchor (last window_len timesteps)
+    if trend_feature_indices is None:
+        trend_feature_indices = []
+    
+    time_axis = dim if dim >= 0 else x.dim() + dim
+    T = x.shape[time_axis]
+    effective_window = min(window_len, T)
+    
+    x_window = x.narrow(time_axis, T - effective_window, effective_window)
+    mask_window = mask.narrow(time_axis, T - effective_window, effective_window)
+    moving_anchor = masked_mean(x=x_window, mask=mask_window, dim=dim)
+    
+    # 4. Hybrid center: Start from global mean
+    center_stats = global_mean.clone()
+    
+    # 5. Apply moving anchor to trend features
+    if len(trend_feature_indices) > 0:
+        idx = trend_feature_indices
+        if dim == 1:  # [B, T, C] format
+            center_stats[:, :, idx] = moving_anchor[:, :, idx]
+            
+            # 6. Apply skewness correction to trend features
+            skew_correction = skew[:, :, idx] * global_stdev[:, :, idx] * 0.1
+            center_stats[:, :, idx] = center_stats[:, :, idx] - skew_correction
+    
+    # 7. Kurtosis-modulated scale
+    kurt_damping = torch.log1p(torch.abs(kurt)) + 1.0
+    robust_stdev = global_stdev / kurt_damping
+    robust_stdev = robust_stdev + eps
+    
+    return center_stats, robust_stdev
+
+
+def skrevin_scaler(x, center_stats, robust_stdev):
+    """Apply SKRevIN forward transformation"""
+    return (x - center_stats) / robust_stdev
+
+
+def inv_skrevin_scaler(z, center_stats, robust_stdev):
+    """Apply SKRevIN inverse transformation"""
+    return z * robust_stdev + center_stats
+
+
 class TemporalNorm(nn.Module):
     r"""Temporal Normalization
 
@@ -374,7 +506,8 @@ class TemporalNorm(nn.Module):
         - [Kin G. Olivares, David Luo, Cristian Challu, Stefania La Vattiata, Max Mergenthaler, Artur Dubrawski (2023). "HINT: Hierarchical Mixture Networks For Coherent Probabilistic Forecasting". Neural Information Processing Systems, submitted. Working Paper version available at arxiv.](https://arxiv.org/abs/2305.07089)
     """
 
-    def __init__(self, scaler_type="robust", dim=-1, eps=1e-6, num_features=None):
+    def __init__(self, scaler_type="robust", dim=-1, eps=1e-6, num_features=None,
+                 window_len=5, trend_feature_indices=None):
         super().__init__()
         compute_statistics = {
             None: identity_statistics,
@@ -385,6 +518,8 @@ class TemporalNorm(nn.Module):
             "minmax": minmax_statistics,
             "minmax1": minmax1_statistics,
             "invariant": invariant_statistics,
+            "marevin": None,
+            "skrevin": None,
         }
         scalers = {
             None: identity_scaler,
@@ -395,6 +530,8 @@ class TemporalNorm(nn.Module):
             "minmax": minmax_scaler,
             "minmax1": minmax1_scaler,
             "invariant": invariant_scaler,
+            "marevin": marevin_scaler,
+            "skrevin": skrevin_scaler,
         }
         inverse_scalers = {
             None: inv_identity_scaler,
@@ -405,11 +542,41 @@ class TemporalNorm(nn.Module):
             "minmax": inv_minmax_scaler,
             "minmax1": inv_minmax1_scaler,
             "invariant": inv_invariant_scaler,
+            "marevin": inv_marevin_scaler,
+            "skrevin": inv_skrevin_scaler,
         }
         assert scaler_type in scalers.keys(), f"{scaler_type} not defined"
-        if (scaler_type == "revin") and (num_features is None):
-            raise Exception("You must pass num_features for ReVIN scaler.")
+        if scaler_type in ("revin", "marevin", "skrevin") and num_features is None:
+            raise Exception("You must pass num_features for ReVIN / MARevIN / SKRevIN scaler.")
 
+        if scaler_type == "marevin":
+            _wl = window_len
+            _tfi = trend_feature_indices if trend_feature_indices is not None else []
+
+            def _marevin_stats_closure(x, mask, dim=-1, eps=1e-6):
+                return marevin_statistics(
+                    x, mask, dim=dim, eps=eps,
+                    window_len=_wl,
+                    trend_feature_indices=_tfi,
+                )
+
+            compute_statistics["marevin"] = _marevin_stats_closure
+            
+        # After existing marevin initialization block:
+        if scaler_type == "skrevin":
+            _wl = window_len
+            _tfi = trend_feature_indices if trend_feature_indices is not None else []
+            
+            def _skrevin_stats_closure(x, mask, dim=-1, eps=1e-6):
+                return skrevin_statistics(
+                    x, mask, dim=dim, eps=eps,
+                    window_len=_wl,
+                    trend_feature_indices=_tfi,
+                )
+            
+            compute_statistics["skrevin"] = _skrevin_stats_closure
+
+        
         self.compute_statistics = compute_statistics[scaler_type]
         self.scaler = scalers[scaler_type]
         self.inverse_scaler = inverse_scalers[scaler_type]
@@ -417,7 +584,7 @@ class TemporalNorm(nn.Module):
         self.dim = dim
         self.eps = eps
 
-        if scaler_type == "revin":
+        if scaler_type in ("revin", "marevin", "skrevin"):
             self._init_params(num_features=num_features)
 
     def _init_params(self, num_features):
@@ -453,7 +620,7 @@ class TemporalNorm(nn.Module):
         # z = z + self.revin_bias
         # However this is only valid for point forecast not for
         # distribution's scale decouple technique.
-        if self.scaler_type == "revin":
+        if self.scaler_type in ("revin", "marevin", "skrevin"):
             self.x_shift = self.x_shift + self.revin_bias
             self.x_scale = self.x_scale * (torch.relu(self.revin_weight) + self.eps)
 

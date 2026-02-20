@@ -12,7 +12,7 @@ from neuralforecast.utils import AirPassengersDF as Y_df
 
 # Unit test for masked predict filtering
 # Declare synthetic batch to normalize
-@pytest.mark.parametrize("scaler_type", [None, 'identity', 'standard', 'robust', 'minmax', 'minmax1', 'invariant', 'revin'])
+@pytest.mark.parametrize("scaler_type", [None, 'identity', 'standard', 'robust', 'minmax', 'minmax1', 'invariant', 'revin', 'marevin', 'skrevin'])
 def test_temporal_norm(scaler_type):
     x1 = 10**0 * np.arange(36)[:, None]
     x2 = 10**1 * np.arange(36)[:, None]
