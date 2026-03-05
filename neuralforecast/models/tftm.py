@@ -66,7 +66,8 @@ class GRN(nn.Module):
     ):
         super().__init__()
         self.layer_norm = MaybeLayerNorm(output_size, hidden_size, eps=1e-3)
-        self.lin_a = nn.Linear(input_size, hidden_size)
+        self.lin_a_down = nn.Linear(input_size, hidden_size // 2)
+        self.lin_a_up = nn.Linear(hidden_size // 2, hidden_size)
         if context_hidden_size is not None:
             self.lin_c = nn.Linear(context_hidden_size, hidden_size, bias=False)
         self.lin_i = nn.Linear(hidden_size, hidden_size)
@@ -76,7 +77,8 @@ class GRN(nn.Module):
         self.activation_fn = get_activation_fn(activation)
 
     def forward(self, a: Tensor, c: Optional[Tensor] = None):
-        x = self.lin_a(a)
+        x = self.lin_a_down(a)
+        x = self.lin_a_up(x)
         if c is not None:
             x = x + self.lin_c(c).unsqueeze(1)
         x = self.activation_fn(x)
@@ -87,7 +89,7 @@ class GRN(nn.Module):
         x = x + y
         x = self.layer_norm(x)
         return x
-    
+
 
 class TFTEmbedding(nn.Module):
     def __init__(
@@ -509,38 +511,6 @@ class TemporalFusionDecoder(nn.Module):
 
         return x, atten_vect
 
-class ModalitySelectionEncoder(nn.Module):
-    def __init__(self, hidden_size, dropout, grn_activation, modality_config):
-        super().__init__()
-        self.modality_config = modality_config
-        
-        self.local_vsns = nn.ModuleDict()
-        for mod_name, num_vars in modality_config.items():
-            self.local_vsns[mod_name] = VariableSelectionNetwork(
-                hidden_size=hidden_size,
-                num_inputs=num_vars,
-                dropout=dropout,
-                grn_activation=grn_activation
-            )
-
-    def forward(self, x: Tensor, context: Optional[Tensor] = None):
-        b, t, _, h = x.shape
-        out_vectors = []
-        local_weights = {}
-        
-        start_idx = 0
-        for mod_name, num_vars in self.modality_config.items():
-            x_mod = x[:, :, start_idx : start_idx + num_vars, :]
-            start_idx += num_vars
-            mod_ctx, sparse_w = self.local_vsns[mod_name](x_mod, context=context)
-            
-            out_vectors.append(mod_ctx.unsqueeze(2))
-            local_weights[mod_name] = sparse_w
-            
-        hierarchical_out = torch.cat(out_vectors, dim=2)
-        
-        return hierarchical_out, local_weights
-
 
 class TFTM(BaseModel):
     """TFT
@@ -683,23 +653,9 @@ class TFTM(BaseModel):
         self.tgt_size = tgt_size
         self.grn_activation = grn_activation
         futr_exog_size = max(self.futr_exog_size, 1)
+        num_historic_vars = futr_exog_size + self.hist_exog_size + tgt_size
         self.n_rnn_layers = n_rnn_layers
         self.rnn_type = rnn_type.lower()
-        
-        self.modality_config = modality_config
-        if self.modality_config is not None:
-            num_historic_vars = futr_exog_size + len(self.modality_config) + tgt_size
-            
-            self.modality_selector = ModalitySelectionEncoder(
-                hidden_size=hidden_size,
-                dropout=dropout,
-                grn_activation=self.grn_activation,
-                modality_config=self.modality_config
-            )
-        else:
-            num_historic_vars = futr_exog_size + self.hist_exog_size + tgt_size
-            self.modality_selector = None
-            
         # ------------------------------- Encoders -----------------------------#
         self.embedding = TFTEmbedding(
             hidden_size=hidden_size,
@@ -791,13 +747,7 @@ class TFTM(BaseModel):
             t_observed_tgt[:, : self.input_size, :],
         ]
         if o_inp is not None:
-            if self.modality_selector is not None:
-                o_inp_hierarchical, local_vsn_wgts = self.modality_selector(o_inp, context=cs)
-                _historical_inputs.insert(0, o_inp_hierarchical[:, : self.input_size, :])
-                self.interpretability_params["local_vsn_wgts"] = local_vsn_wgts
-            else:
-                _historical_inputs.insert(0, o_inp[:, : self.input_size, :])
-            
+            _historical_inputs.insert(0, o_inp[:, : self.input_size, :])
         historical_inputs = torch.cat(_historical_inputs, dim=-2)
         # Future inputs
         future_inputs = k_inp[:, self.input_size :]
@@ -855,10 +805,7 @@ class TFTM(BaseModel):
 
         # Historical feature importances
         hist_vsn_wgts = self.interpretability_params.get("history_vsn_wgts")
-        if self.modality_config is not None:
-            hist_exog_list = list(self.modality_config.keys()) + list(self.futr_exog_list)
-        else:
-            hist_exog_list = list(self.hist_exog_list) + list(self.futr_exog_list)
+        hist_exog_list = list(self.hist_exog_list) + list(self.futr_exog_list)
         hist_exog_list += (
             [f"observed_target_{i+1}" for i in range(self.tgt_size)]
             if self.tgt_size > 1
@@ -869,24 +816,8 @@ class TFTM(BaseModel):
         hist_vsn_imp = pd.DataFrame(
             self.mean_on_batch(hist_vsn_wgts).cpu().numpy(), columns=hist_exog_list
         )
-        importances["Past global variable importance over time"] = hist_vsn_imp
+        importances["Past variable importance over time"] = hist_vsn_imp
         #  importances["Past variable importance"] = hist_vsn_imp.mean(axis=0).sort_values()
-
-        if self.modality_config is not None:
-            local_wgts = self.interpretability_params.get("local_vsn_wgts")
-            start_idx = 0
-            for mod_name, num_vars in self.modality_config.items():
-                wgt_tensor = local_wgts[mod_name]
-                if hasattr(self, 'hist_exog_list') and len(self.hist_exog_list) > 0:
-                    col_names = self.hist_exog_list[start_idx : start_idx + num_vars]
-                else:
-                    col_names = [f"{mod_name}_Var_{i+1}" for i in range(num_vars)]
-                start_idx += num_vars
-                
-                local_imp = pd.DataFrame(
-                    self.mean_on_batch(wgt_tensor).cpu().numpy(), columns=col_names
-                )
-                importances[f"Past local variabels importance [{mod_name}]"] = local_imp
 
         # Future feature importances
         if self.futr_exog_size > 0:
