@@ -1,7 +1,7 @@
 
 
 
-__all__ = ['TFTM']
+__all__ = ['TFTS']
 
 
 from typing import Callable, Optional, Tuple
@@ -510,13 +510,13 @@ class TemporalFusionDecoder(nn.Module):
         return x, atten_vect
 
 
-class TFTM(BaseModel):
-    """TFT
+class TFTS(BaseModel):
+    """TFTS
 
     The Temporal Fusion Transformer architecture (TFT) is an Sequence-to-Sequence
     model that combines static, historic and future available data to predict an
-    univariate target. The method combines gating layers, an LSTM recurrent encoder,
-    with and interpretable multi-head attention layer and a multi-step forecasting
+    univariate target. The method combines shared gating layers, an LSTM recurrent encoder,
+    with an interpretable multi-head attention layer and a multi-step forecasting
     strategy decoder.
 
     Args:
@@ -580,7 +580,6 @@ class TFTM(BaseModel):
         stat_exog_list=None,
         hist_exog_list=None,
         futr_exog_list=None,
-        modality_config=None,
         hidden_size: int = 128,
         n_head: int = 4,
         attn_dropout: float = 0.0,
@@ -615,7 +614,7 @@ class TFTM(BaseModel):
         **trainer_kwargs,
     ):
         # Inherit BaseWindows class
-        super(TFTM, self).__init__(
+        super(TFTS, self).__init__(
             h=h,
             input_size=input_size,
             stat_exog_list=stat_exog_list,
