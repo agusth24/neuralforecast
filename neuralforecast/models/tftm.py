@@ -4,7 +4,7 @@
 __all__ = ['TFTM']
 
 
-from typing import Callable, Optional, Tuple, List, Dict
+from typing import Callable, Optional, Tuple
 
 import pandas as pd
 import torch
@@ -54,114 +54,6 @@ class GLU(nn.Module):
         return x
 
 
-class ModalitySplitter(nn.Module):
-    def __init__(
-        self,
-        modality_config: Dict[str, int],
-        hidden_size: int,
-    ):
-        super().__init__()
-        self.modality_config = modality_config
-        self.hidden_size = hidden_size
-        
-        self.total_features = sum(modality_config.values())
-        
-        self.modality_projections = nn.ModuleDict()
-        for modality_name, n_features in modality_config.items():
-            if n_features > 0:
-                self.modality_projections[modality_name] = nn.Linear(
-                    n_features, hidden_size
-                )
-        
-        self.modality_order = list(modality_config.keys())
-    
-    def forward(self, historical_inputs: Tensor) -> List[Tensor]:
-        batch_size, seq_len, num_vars, hidden_size = historical_inputs.shape
-        
-        if num_vars != self.total_features:
-            raise ValueError(
-                f"Feature count mismatch!\n"
-                f"  Expected: {self.total_features}\n"
-                f"  Got: {num_vars}\n"
-                f"  Modality breakdown: {self.modality_config}"
-            )
-        
-        modality_features = []
-        idx = 0
-        
-        for modality_name in self.modality_order:
-            n_features = self.modality_config[modality_name]
-            
-            if n_features > 0:
-                modality_vars = historical_inputs[:, :, idx:idx+n_features, :]                
-                modality_pooled = modality_vars.mean(dim=2)
-                
-                modality_features.append(modality_pooled)
-                idx += n_features
-            else:
-                dummy = torch.zeros(
-                    batch_size, seq_len, self.hidden_size,
-                    device=historical_inputs.device
-                )
-                modality_features.append(dummy)
-        
-        return modality_features
-
-
-class AdaptiveMultimodalGating(nn.Module):
-    def __init__(
-        self,
-        hidden_size: int,
-        num_modalities: int,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.num_modalities = num_modalities
-        self.hidden_size = hidden_size
-        
-        self.gate_layer1 = nn.Linear(
-            hidden_size * num_modalities, 
-            hidden_size
-        )
-        
-        self.gate_layer2 = nn.Linear(
-            hidden_size, 
-            num_modalities
-        )
-        
-        self.modality_transforms = nn.ModuleList([
-            nn.Linear(hidden_size, hidden_size)
-            for _ in range(num_modalities)
-        ])
-        
-        self.dropout = nn.Dropout(dropout)
-        self.layer_norm = LayerNorm(hidden_size, eps=1e-3)
-        
-    def forward(self, modality_features: List[Tensor]) -> Tuple[Tensor, Tensor]:
-        concat_features = torch.cat(modality_features, dim=-1)
-        
-        gate_hidden = F.elu(self.gate_layer1(concat_features))
-        gate_logits = self.gate_layer2(gate_hidden)
-        gating_weights = F.softmax(gate_logits, dim=-1)
-        
-        transformed_modalities = []
-        for i, transform in enumerate(self.modality_transforms):
-            transformed = transform(modality_features[i])
-            transformed_modalities.append(transformed)
-        
-        stacked_modalities = torch.stack(transformed_modalities, dim=-1)
-        
-        fused_features = torch.sum(
-            stacked_modalities * gating_weights.unsqueeze(-2),
-            dim=-1
-        )
-        
-        fused_features = self.dropout(fused_features)
-        fused_features = self.layer_norm(fused_features)
-        
-        return fused_features, gating_weights
-
-
 class GRN(nn.Module):
     def __init__(
         self,
@@ -197,9 +89,39 @@ class GRN(nn.Module):
         return x
 
 
+class ModalityEncoder(nn.Module):
+    def __init__(self, hidden_size, modality_config):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.modality_config = modality_config
+        
+        self.projections = nn.ModuleList()
+        for mod_name, (in_features, n_reps) in modality_config.items():
+            self.projections.append(nn.Linear(in_features, n_reps * hidden_size))
+            
+        self.activation = nn.ELU()
+            
+    def forward(self, x: Tensor) -> Tensor:
+        b, t, _ = x.shape
+        out_vectors = []
+        
+        start_idx = 0
+        for i, (mod_name, (in_features, n_reps)) in enumerate(self.modality_config.items()):
+            x_mod = x[:, :, start_idx : start_idx + in_features]
+            start_idx += in_features
+            
+            proj = self.projections[i](x_mod)
+            proj = self.activation(proj)
+            
+            proj = proj.view(b, t, n_reps, self.hidden_size)
+            out_vectors.append(proj)
+            
+        return torch.cat(out_vectors, dim=2)
+    
+
 class TFTEmbedding(nn.Module):
     def __init__(
-        self, hidden_size, stat_input_size, futr_input_size, hist_input_size, tgt_size
+        self, hidden_size, stat_input_size, futr_input_size, hist_input_size, tgt_size, modality_config
     ):
         super().__init__()
         # There are 4 types of input:
@@ -214,6 +136,12 @@ class TFTEmbedding(nn.Module):
         self.futr_input_size = futr_input_size
         self.hist_input_size = hist_input_size
         self.tgt_size = tgt_size
+        self.modality_config = modality_config
+
+        if self.modality_config is not None and hist_input_size > 0:
+            self.hist_modality = ModalityEncoder(hidden_size, modality_config)
+        else:
+            self.hist_modality = None
 
         # Instantiate Continuous Embeddings if size is not None
         for attr, size in [
@@ -266,11 +194,14 @@ class TFTEmbedding(nn.Module):
             cont_emb=self.futr_exog_embedding_vectors,
             cont_bias=self.futr_exog_embedding_bias,
         )
-        o_inp = self._apply_embedding(
-            cont=hist_exog,
-            cont_emb=self.hist_exog_embedding_vectors,
-            cont_bias=self.hist_exog_embedding_bias,
-        )
+        if self.hist_modality is not None and hist_exog is not None:
+            o_inp = self.hist_modality(hist_exog)
+        else:
+            o_inp = self._apply_embedding(
+                cont=hist_exog,
+                cont_emb=self.hist_exog_embedding_vectors,
+                cont_bias=self.hist_exog_embedding_bias,
+            )
 
         # Temporal observed targets
         # t_observed_tgt = torch.einsum('btf,fh->btfh',
@@ -470,7 +401,6 @@ class TemporalCovariateEncoder(nn.Module):
         grn_activation,
         rnn_type="lstm",
         n_rnn_layers=1,
-        modality_config=None
     ):
         super(TemporalCovariateEncoder, self).__init__()
         self.rnn_type = rnn_type.lower()
@@ -523,21 +453,6 @@ class TemporalCovariateEncoder(nn.Module):
         # Shared Gated-Skip Connection
         self.input_gate = GLU(hidden_size, hidden_size)
         self.input_gate_ln = LayerNorm(hidden_size, eps=1e-3)
-        
-        if modality_config:
-            self.use_modality_gating = True
-            
-            self.modality_splitter = ModalitySplitter(
-                modality_config=modality_config,
-                hidden_size=hidden_size,
-            )
-            
-            num_modalities = len(modality_config)
-            self.adaptive_multimodal_gating = AdaptiveMultimodalGating(
-                hidden_size=hidden_size,
-                num_modalities=num_modalities,
-                dropout=dropout,
-            )
 
     def forward(self, historical_inputs, future_inputs, cs, ch, cc):
         # [N,X_in,L] -> [N,hidden_size,L]
@@ -559,22 +474,7 @@ class TemporalCovariateEncoder(nn.Module):
         temporal_features = self.input_gate(temporal_features)
         temporal_features = temporal_features + input_embedding
         temporal_features = self.input_gate_ln(temporal_features)
-        
-        gating_weights = None
-        if self.use_modality_gating:
-            modality_features = self.modality_splitter(historical_inputs)
-            fused_history, gating_weights = self.adaptive_multimodal_gating(
-                modality_features
-            )
-            history = fused_history
-            
-        input_embedding = torch.cat([historical_features, future_features], dim=1)
-        temporal_features = torch.cat([history, future], dim=1)
-        temporal_features = self.input_gate(temporal_features)
-        temporal_features = temporal_features + input_embedding
-        temporal_features = self.input_gate_ln(temporal_features)
-            
-        return temporal_features, history_vsn_sparse_weights, future_vsn_sparse_weights, gating_weights
+        return temporal_features, history_vsn_sparse_weights, future_vsn_sparse_weights
 
 
 class TemporalFusionDecoder(nn.Module):
@@ -719,7 +619,7 @@ class TFTM(BaseModel):
         stat_exog_list=None,
         hist_exog_list=None,
         futr_exog_list=None,
-        modality_config: Optional[Dict[str, int]] = None,
+        modality_config=None,
         hidden_size: int = 128,
         n_head: int = 4,
         attn_dropout: float = 0.0,
@@ -789,42 +689,16 @@ class TFTM(BaseModel):
         self.interpretability_params = dict([])  # type: ignore
         self.tgt_size = tgt_size
         self.grn_activation = grn_activation
-        
-        if modality_config is None:
-            modality_config = {}
-            self.use_modality_gating = False
-        else:
-            self.use_modality_gating = True
-            total_modality_features = sum(modality_config.values())
-            expected_features = self.hist_exog_size + 1
-            
-            if total_modality_features != expected_features:
-                raise ValueError(
-                    f"MODALITY CONFIG MISMATCH!\n"
-                    f"Sum of modality features: {total_modality_features}\n"
-                    f"Expected (hist_exog_size + t_observed_tgt): {expected_features}\n"
-                    f"  - hist_exog_size: {self.hist_exog_size}\n"
-                    f"  - t_observed_tgt: 1\n"
-                    f"\nModality breakdown:\n"
-                    + "\n".join(f"  - {k}: {v}" for k, v in modality_config.items())
-                )
-                
-        modality_config['temporal_mask'] = 1
-        self.modality_config = modality_config
-        num_modalities = len(modality_config) if modality_config else 0
-        
-        if self.use_modality_gating:
-            print(f"TFT with Multimodal Gating Initialization:")
-            print(f"  Input size (lags): {input_size}")
-            print(f"  Horizon: {h}")
-            print(f"  hist_exog_size: {self.hist_exog_size}")
-            print(f"  Use modality gating: {self.use_modality_gating}")
-            print(f"  Number of modalities: {num_modalities}")
-        
         futr_exog_size = max(self.futr_exog_size, 1)
-        num_historic_vars = futr_exog_size + self.hist_exog_size + tgt_size
         self.n_rnn_layers = n_rnn_layers
         self.rnn_type = rnn_type.lower()
+        
+        self.modality_config = modality_config
+        if self.modality_config is not None:
+            total_n_reps = sum([config[1] for config in self.modality_config.values()])
+            num_historic_vars = futr_exog_size + total_n_reps + tgt_size
+        else:
+            num_historic_vars = futr_exog_size + self.hist_exog_size + tgt_size
         # ------------------------------- Encoders -----------------------------#
         self.embedding = TFTEmbedding(
             hidden_size=hidden_size,
@@ -832,6 +706,7 @@ class TFTM(BaseModel):
             futr_input_size=futr_exog_size,
             hist_input_size=self.hist_exog_size,
             tgt_size=tgt_size,
+            modality_config=self.modality_config,
         )
 
         if self.stat_exog_size > 0:
@@ -853,7 +728,6 @@ class TFTM(BaseModel):
             grn_activation=self.grn_activation,
             n_rnn_layers=n_rnn_layers,
             rnn_type=self.rnn_type,
-            modality_config=modality_config,
         )
 
         # ------------------------------ Decoders -----------------------------#
@@ -924,7 +798,7 @@ class TFTM(BaseModel):
 
         # ---------------------------- Encode/Decode ---------------------------#
         # Embeddings + VSN + LSTM encoders
-        temporal_features, history_vsn_wgts, future_vsn_wgts, gating_weights = self.temporal_encoder(
+        temporal_features, history_vsn_wgts, future_vsn_wgts = self.temporal_encoder(
             historical_inputs=historical_inputs,
             future_inputs=future_inputs,
             cs=cs,
@@ -943,7 +817,6 @@ class TFTM(BaseModel):
             "future_vsn_wgts": future_vsn_wgts,
             "static_encoder_sparse_weights": static_encoder_sparse_weights,
             "attn_wts": attn_wts,
-            "gating_weights": gating_weights,
         }
 
         # Adapt output to loss
@@ -976,7 +849,17 @@ class TFTM(BaseModel):
 
         # Historical feature importances
         hist_vsn_wgts = self.interpretability_params.get("history_vsn_wgts")
-        hist_exog_list = list(self.hist_exog_list) + list(self.futr_exog_list)
+        if self.modality_config is not None:
+            hist_exog_list = []
+            for mod_name, (in_f, n_reps) in self.modality_config.items():
+                if n_reps == 1:
+                    hist_exog_list.append(f"{mod_name}_Rep")
+                else:
+                    for i in range(n_reps):
+                        hist_exog_list.append(f"{mod_name}_Rep_{i+1}")
+            hist_exog_list += list(self.futr_exog_list)
+        else:
+            hist_exog_list = list(self.hist_exog_list) + list(self.futr_exog_list)
         hist_exog_list += (
             [f"observed_target_{i+1}" for i in range(self.tgt_size)]
             if self.tgt_size > 1
@@ -1015,17 +898,6 @@ class TFTM(BaseModel):
                 by="importance"
             )
 
-        if self.use_modality_gating:
-            gating_weights = self.interpretability_params.get("gating_weights")
-            if gating_weights is not None:
-                modality_names = list(self.modality_config.keys())
-                gating_imp = pd.DataFrame(
-                    self.mean_on_batch(gating_weights).cpu().numpy(),
-                    columns=modality_names
-                )
-                importances["Multimodal Gating Weights over time"] = gating_imp
-                importances["Average Multimodal Importance"] = gating_imp.mean(axis=0).sort_values()
-                
         return importances
 
     def attention_weights(self):
