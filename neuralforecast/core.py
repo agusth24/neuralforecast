@@ -58,7 +58,7 @@ from neuralforecast.models import (
     VanillaTransformer,
     iTransformer,
     xLSTM,
-    TFTM,
+    TFTS,
 )
 from neuralforecast.tsdataset import (
     LocalFilesTimeSeriesDataset,
@@ -203,7 +203,7 @@ MODEL_FILENAME_DICT = {
     "autotimexer": TimeXer,
     "xlstm": xLSTM,
     "autoxlstm": xLSTM,
-    "tftm": TFTM,
+    "tfts": TFTS,
 }
 
 
