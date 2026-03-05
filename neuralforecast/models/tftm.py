@@ -87,41 +87,11 @@ class GRN(nn.Module):
         x = x + y
         x = self.layer_norm(x)
         return x
-
-
-class ModalityEncoder(nn.Module):
-    def __init__(self, hidden_size, modality_config):
-        super().__init__()
-        self.hidden_size = hidden_size
-        self.modality_config = modality_config
-        
-        self.projections = nn.ModuleList()
-        for mod_name, (in_features, n_reps) in modality_config.items():
-            self.projections.append(nn.Linear(in_features, n_reps * hidden_size))
-            
-        self.activation = nn.ELU()
-            
-    def forward(self, x: Tensor) -> Tensor:
-        b, t, _ = x.shape
-        out_vectors = []
-        
-        start_idx = 0
-        for i, (mod_name, (in_features, n_reps)) in enumerate(self.modality_config.items()):
-            x_mod = x[:, :, start_idx : start_idx + in_features]
-            start_idx += in_features
-            
-            proj = self.projections[i](x_mod)
-            proj = self.activation(proj)
-            
-            proj = proj.view(b, t, n_reps, self.hidden_size)
-            out_vectors.append(proj)
-            
-        return torch.cat(out_vectors, dim=2)
     
 
 class TFTEmbedding(nn.Module):
     def __init__(
-        self, hidden_size, stat_input_size, futr_input_size, hist_input_size, tgt_size, modality_config
+        self, hidden_size, stat_input_size, futr_input_size, hist_input_size, tgt_size
     ):
         super().__init__()
         # There are 4 types of input:
@@ -136,12 +106,6 @@ class TFTEmbedding(nn.Module):
         self.futr_input_size = futr_input_size
         self.hist_input_size = hist_input_size
         self.tgt_size = tgt_size
-        self.modality_config = modality_config
-
-        if self.modality_config is not None and hist_input_size > 0:
-            self.hist_modality = ModalityEncoder(hidden_size, modality_config)
-        else:
-            self.hist_modality = None
 
         # Instantiate Continuous Embeddings if size is not None
         for attr, size in [
@@ -194,14 +158,11 @@ class TFTEmbedding(nn.Module):
             cont_emb=self.futr_exog_embedding_vectors,
             cont_bias=self.futr_exog_embedding_bias,
         )
-        if self.hist_modality is not None and hist_exog is not None:
-            o_inp = self.hist_modality(hist_exog)
-        else:
-            o_inp = self._apply_embedding(
-                cont=hist_exog,
-                cont_emb=self.hist_exog_embedding_vectors,
-                cont_bias=self.hist_exog_embedding_bias,
-            )
+        o_inp = self._apply_embedding(
+            cont=hist_exog,
+            cont_emb=self.hist_exog_embedding_vectors,
+            cont_bias=self.hist_exog_embedding_bias,
+        )
 
         # Temporal observed targets
         # t_observed_tgt = torch.einsum('btf,fh->btfh',
@@ -548,6 +509,38 @@ class TemporalFusionDecoder(nn.Module):
 
         return x, atten_vect
 
+class ModalitySelectionEncoder(nn.Module):
+    def __init__(self, hidden_size, dropout, grn_activation, modality_config):
+        super().__init__()
+        self.modality_config = modality_config
+        
+        self.local_vsns = nn.ModuleDict()
+        for mod_name, num_vars in modality_config.items():
+            self.local_vsns[mod_name] = VariableSelectionNetwork(
+                hidden_size=hidden_size,
+                num_inputs=num_vars,
+                dropout=dropout,
+                grn_activation=grn_activation
+            )
+
+    def forward(self, x: Tensor, context: Optional[Tensor] = None):
+        b, t, _, h = x.shape
+        out_vectors = []
+        local_weights = {}
+        
+        start_idx = 0
+        for mod_name, num_vars in self.modality_config.items():
+            x_mod = x[:, :, start_idx : start_idx + num_vars, :]
+            start_idx += num_vars
+            mod_ctx, sparse_w = self.local_vsns[mod_name](x_mod, context=context)
+            
+            out_vectors.append(mod_ctx.unsqueeze(2))
+            local_weights[mod_name] = sparse_w
+            
+        hierarchical_out = torch.cat(out_vectors, dim=2)
+        
+        return hierarchical_out, local_weights
+
 
 class TFTM(BaseModel):
     """TFT
@@ -695,10 +688,18 @@ class TFTM(BaseModel):
         
         self.modality_config = modality_config
         if self.modality_config is not None:
-            total_n_reps = sum([config[1] for config in self.modality_config.values()])
-            num_historic_vars = futr_exog_size + total_n_reps + tgt_size
+            num_historic_vars = futr_exog_size + len(self.modality_config) + tgt_size
+            
+            self.modality_selector = ModalitySelectionEncoder(
+                hidden_size=hidden_size,
+                dropout=dropout,
+                grn_activation=self.grn_activation,
+                modality_config=self.modality_config
+            )
         else:
             num_historic_vars = futr_exog_size + self.hist_exog_size + tgt_size
+            self.modality_selector = None
+            
         # ------------------------------- Encoders -----------------------------#
         self.embedding = TFTEmbedding(
             hidden_size=hidden_size,
@@ -706,7 +707,6 @@ class TFTM(BaseModel):
             futr_input_size=futr_exog_size,
             hist_input_size=self.hist_exog_size,
             tgt_size=tgt_size,
-            modality_config=self.modality_config,
         )
 
         if self.stat_exog_size > 0:
@@ -791,7 +791,13 @@ class TFTM(BaseModel):
             t_observed_tgt[:, : self.input_size, :],
         ]
         if o_inp is not None:
-            _historical_inputs.insert(0, o_inp[:, : self.input_size, :])
+            if self.modality_selector is not None:
+                o_inp_hierarchical, local_vsn_wgts = self.modality_selector(o_inp, context=cs)
+                _historical_inputs.insert(0, o_inp_hierarchical[:, : self.input_size, :])
+                self.interpretability_params["local_vsn_wgts"] = local_vsn_wgts
+            else:
+                _historical_inputs.insert(0, o_inp[:, : self.input_size, :])
+            
         historical_inputs = torch.cat(_historical_inputs, dim=-2)
         # Future inputs
         future_inputs = k_inp[:, self.input_size :]
@@ -850,14 +856,7 @@ class TFTM(BaseModel):
         # Historical feature importances
         hist_vsn_wgts = self.interpretability_params.get("history_vsn_wgts")
         if self.modality_config is not None:
-            hist_exog_list = []
-            for mod_name, (in_f, n_reps) in self.modality_config.items():
-                if n_reps == 1:
-                    hist_exog_list.append(f"{mod_name}_Rep")
-                else:
-                    for i in range(n_reps):
-                        hist_exog_list.append(f"{mod_name}_Rep_{i+1}")
-            hist_exog_list += list(self.futr_exog_list)
+            hist_exog_list = list(self.modality_config.keys()) + list(self.futr_exog_list)
         else:
             hist_exog_list = list(self.hist_exog_list) + list(self.futr_exog_list)
         hist_exog_list += (
@@ -870,8 +869,24 @@ class TFTM(BaseModel):
         hist_vsn_imp = pd.DataFrame(
             self.mean_on_batch(hist_vsn_wgts).cpu().numpy(), columns=hist_exog_list
         )
-        importances["Past variable importance over time"] = hist_vsn_imp
+        importances["Past global variable importance over time"] = hist_vsn_imp
         #  importances["Past variable importance"] = hist_vsn_imp.mean(axis=0).sort_values()
+
+        if self.modality_config is not None:
+            local_wgts = self.interpretability_params.get("local_vsn_wgts")
+            start_idx = 0
+            for mod_name, num_vars in self.modality_config.items():
+                wgt_tensor = local_wgts[mod_name]
+                if hasattr(self, 'hist_exog_list') and len(self.hist_exog_list) > 0:
+                    col_names = self.hist_exog_list[start_idx : start_idx + num_vars]
+                else:
+                    col_names = [f"{mod_name}_Var_{i+1}" for i in range(num_vars)]
+                start_idx += num_vars
+                
+                local_imp = pd.DataFrame(
+                    self.mean_on_batch(wgt_tensor).cpu().numpy(), columns=col_names
+                )
+                importances[f"Past local variabels importance [{mod_name}]"] = local_imp
 
         # Future feature importances
         if self.futr_exog_size > 0:
