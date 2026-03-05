@@ -66,8 +66,7 @@ class GRN(nn.Module):
     ):
         super().__init__()
         self.layer_norm = MaybeLayerNorm(output_size, hidden_size, eps=1e-3)
-        self.lin_a_down = nn.Linear(input_size, hidden_size // 2)
-        self.lin_a_up = nn.Linear(hidden_size // 2, hidden_size)
+        self.lin_a = nn.Linear(input_size, hidden_size)
         if context_hidden_size is not None:
             self.lin_c = nn.Linear(context_hidden_size, hidden_size, bias=False)
         self.lin_i = nn.Linear(hidden_size, hidden_size)
@@ -77,8 +76,7 @@ class GRN(nn.Module):
         self.activation_fn = get_activation_fn(activation)
 
     def forward(self, a: Tensor, c: Optional[Tensor] = None):
-        x = self.lin_a_down(a)
-        x = self.lin_a_up(x)
+        x = self.lin_a(a)
         if c is not None:
             x = x + self.lin_c(c).unsqueeze(1)
         x = self.activation_fn(x)
@@ -181,6 +179,8 @@ class TFTEmbedding(nn.Module):
 class VariableSelectionNetwork(nn.Module):
     def __init__(self, hidden_size, num_inputs, dropout, grn_activation):
         super().__init__()
+        self.num_inputs = num_inputs
+        
         self.joint_grn = GRN(
             input_size=hidden_size * num_inputs,
             hidden_size=hidden_size,
@@ -188,23 +188,21 @@ class VariableSelectionNetwork(nn.Module):
             context_hidden_size=hidden_size,
             activation=grn_activation,
         )
-        self.var_grns = nn.ModuleList(
-            [
-                GRN(
-                    input_size=hidden_size,
-                    hidden_size=hidden_size,
-                    dropout=dropout,
-                    activation=grn_activation,
-                )
-                for _ in range(num_inputs)
-            ]
+        self.shared_var_grn = GRN(
+            input_size=hidden_size,
+            hidden_size=hidden_size,
+            dropout=dropout,
+            activation=grn_activation,
+        )
+        self.var_bias = nn.Parameter(
+            torch.zeros(num_inputs, hidden_size)
         )
 
     def forward(self, x: Tensor, context: Optional[Tensor] = None):
         Xi = x.reshape(*x.shape[:-2], -1)
         grn_outputs = self.joint_grn(Xi, c=context)
         sparse_weights = F.softmax(grn_outputs, dim=-1)
-        transformed_embed_list = [m(x[..., i, :]) for i, m in enumerate(self.var_grns)]
+        transformed_embed_list = [self.shared_var_grn(x[..., i, :]) + self.var_bias[i] for i in range(self.num_inputs)]
         transformed_embed = torch.stack(transformed_embed_list, dim=-1)
         # the line below performs batched matrix vector multiplication
         # for temporal features it's bthf,btf->bth
