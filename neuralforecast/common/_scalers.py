@@ -378,7 +378,9 @@ def marevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_in
     global_stdev = global_stdev + eps
 
     if trend_feature_indices is None:
-        trend_feature_indices = []
+        trend_feature_indices = [0]
+    else:
+        trend_feature_indices = [0] + trend_feature_indices
 
     if len(trend_feature_indices) == 0:
         return global_mean, global_stdev
@@ -422,14 +424,16 @@ def skrevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_in
     global_stdev = global_stdev + eps
     
     if trend_feature_indices is None:
-        trend_feature_indices = []
+        trend_feature_indices = [0]
+    else:
+        trend_feature_indices = [0] + trend_feature_indices
 
     if len(trend_feature_indices) == 0:
         return global_mean, global_stdev
 
     z = (x - global_mean) / global_stdev
     skew = masked_mean(x=z**3, mask=mask, dim=dim)
-    kurt = masked_mean(x=z**4, mask=mask, dim=dim)
+    kurt = masked_mean(x=z**4, mask=mask, dim=dim) - 3.0
     
     time_axis = dim if dim >= 0 else x.dim() + dim
     T = x.shape[time_axis]
