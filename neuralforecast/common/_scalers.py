@@ -371,39 +371,33 @@ def marevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_in
         tuple[torch.Tensor, torch.Tensor]: (center_stats, stdev), both broadcastable
             to the shape of `x`.
     """
+    global_mean = masked_mean(x=x, mask=mask, dim=dim)
+    global_stdev = torch.sqrt(masked_mean(x=(x - global_mean) ** 2, mask=mask, dim=dim))
+
+    global_stdev[global_stdev == 0] = 1.0
+    global_stdev = global_stdev + eps
+
     if trend_feature_indices is None:
         trend_feature_indices = []
 
-    # Global statistics (masked)
-    global_mean = masked_mean(x=x, mask=mask, dim=dim)
-    x_stds = torch.sqrt(masked_mean(x=(x - global_mean) ** 2, mask=mask, dim=dim))
+    if len(trend_feature_indices) == 0:
+        return global_mean, global_stdev
 
-    # Protect against division by zero
-    x_stds[x_stds == 0] = 1.0
-    x_stds = x_stds + eps
+    time_axis = dim if dim >= 0 else x.dim() + dim
+    T = x.shape[time_axis]
+    effective_window = min(window_len, T)
 
-    # Local moving anchor (last window_len timesteps)
-    if len(trend_feature_indices) > 0:
-        time_axis = dim if dim >= 0 else x.dim() + dim
-        T = x.shape[time_axis]
-        effective_window = min(window_len, T)
+    x_window = x.narrow(time_axis, T - effective_window, effective_window)
+    mask_window = mask.narrow(time_axis, T - effective_window, effective_window)
+    moving_anchor = masked_mean(x=x_window, mask=mask_window, dim=dim)
 
-        x_window = x.narrow(time_axis, T - effective_window, effective_window)
-        mask_window = mask.narrow(time_axis, T - effective_window, effective_window)
-        moving_anchor = masked_mean(x=x_window, mask=mask_window, dim=dim)
-
-    # Hybrid center: start from global mean, overwrite trend channels
     center_stats = global_mean.clone()
+    idx = trend_feature_indices
 
-    if len(trend_feature_indices) > 0:
-        idx = trend_feature_indices
-        if dim == 1:
-            # center_stats shape: [B, 1, C] — channel axis = 2
-            center_stats[:, :, idx] = moving_anchor[:, :, idx]
-        # dim=-1 on [B,T,C] collapses C → [B,T,1], per-channel anchor
-        # doesn't apply — global mean is kept (safe no-op fallback).
-    
-    return center_stats, x_stds
+    if dim == 1:
+        center_stats[:, :, idx] = moving_anchor[:, :, idx]
+        
+    return center_stats, global_stdev
 
 
 def marevin_scaler(x, center_stats, stdev):
@@ -416,24 +410,26 @@ def inv_marevin_scaler(z, center_stats, stdev):
 
 def skrevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_indices=None):
     """
-    Computes SKRevIN statistics:
-    - Center: Moving anchor (mean of last window_len) with skewness correction
-    - Scale: Global std modulated by kurtosis
+    Computes SKRevIN statistics with strict fallback to Standard Statistics.
+    - Non-trend features: Use global mean and global std.
+    - Trend features: Use moving anchor + skewness correction for center, 
+                      and kurtosis-modulated global std for scale.
     """
-    # 1. Global statistics (for skew/kurt computation)
     global_mean = masked_mean(x=x, mask=mask, dim=dim)
     global_stdev = torch.sqrt(masked_mean(x=(x - global_mean) ** 2, mask=mask, dim=dim))
+    
     global_stdev[global_stdev == 0] = 1.0
     global_stdev = global_stdev + eps
     
-    # 2. Compute skewness and kurtosis
+    if trend_feature_indices is None:
+        trend_feature_indices = []
+
+    if len(trend_feature_indices) == 0:
+        return global_mean, global_stdev
+
     z = (x - global_mean) / global_stdev
     skew = masked_mean(x=z**3, mask=mask, dim=dim)
     kurt = masked_mean(x=z**4, mask=mask, dim=dim)
-    
-    # 3. Local moving anchor (last window_len timesteps)
-    if trend_feature_indices is None:
-        trend_feature_indices = []
     
     time_axis = dim if dim >= 0 else x.dim() + dim
     T = x.shape[time_axis]
@@ -443,24 +439,18 @@ def skrevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_in
     mask_window = mask.narrow(time_axis, T - effective_window, effective_window)
     moving_anchor = masked_mean(x=x_window, mask=mask_window, dim=dim)
     
-    # 4. Hybrid center: Start from global mean
     center_stats = global_mean.clone()
+    robust_stdev = global_stdev.clone()
+    idx = trend_feature_indices
     
-    # 5. Apply moving anchor to trend features
-    if len(trend_feature_indices) > 0:
-        idx = trend_feature_indices
-        if dim == 1:  # [B, T, C] format
-            center_stats[:, :, idx] = moving_anchor[:, :, idx]
-            
-            # 6. Apply skewness correction to trend features
-            skew_correction = skew[:, :, idx] * global_stdev[:, :, idx] * 0.1
-            center_stats[:, :, idx] = center_stats[:, :, idx] - skew_correction
-    
-    # 7. Kurtosis-modulated scale
-    kurt_damping = torch.log1p(torch.abs(kurt)) + 1.0
-    robust_stdev = global_stdev / kurt_damping
-    robust_stdev = robust_stdev + eps
-    
+    if dim == 1:
+        center_stats[:, :, idx] = moving_anchor[:, :, idx]
+        skew_correction = skew[:, :, idx] * global_stdev[:, :, idx] * 0.1
+        center_stats[:, :, idx] = center_stats[:, :, idx] - skew_correction
+        
+        kurt_damping = torch.log1p(torch.abs(kurt[:, :, idx])) + 1.0
+        robust_stdev[:, :, idx] = global_stdev[:, :, idx] / kurt_damping
+
     return center_stats, robust_stdev
 
 
