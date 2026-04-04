@@ -378,9 +378,7 @@ def marevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_in
     global_stdev = global_stdev + eps
 
     if trend_feature_indices is None:
-        trend_feature_indices = [0]
-    else:
-        trend_feature_indices = [0] + trend_feature_indices
+        trend_feature_indices = []
 
     if len(trend_feature_indices) == 0:
         return global_mean, global_stdev
@@ -424,9 +422,7 @@ def skrevin_statistics(x, mask, dim=-1, eps=1e-6, window_len=5, trend_feature_in
     global_stdev = global_stdev + eps
     
     if trend_feature_indices is None:
-        trend_feature_indices = [0]
-    else:
-        trend_feature_indices = [0] + trend_feature_indices
+        trend_feature_indices = []
 
     if len(trend_feature_indices) == 0:
         return global_mean, global_stdev
